@@ -2023,7 +2023,7 @@ fn parse_check_line(line: &[u8]) -> Option<CheckLine<'_>> {
     }
 
     let mut digest = [0u8; 32];
-    for (index, pair) in hex.chunks_exact(2).enumerate() {
+    for (index, pair) in hex.as_chunks::<2>().0.iter().enumerate() {
         let value = |byte: u8| match byte {
             b'0'..=b'9' => Some(byte - b'0'),
             b'a'..=b'f' => Some(byte - b'a' + 10),
