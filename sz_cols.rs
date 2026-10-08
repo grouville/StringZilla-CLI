@@ -14,7 +14,7 @@ use std::io::{self, Write};
 use std::ops::RangeInclusive;
 
 use clap::{error::ErrorKind, CommandFactory, Parser, ValueEnum};
-use stringzilla::sz::{FindSplits, MatcherType};
+use stringzilla::sz::{FindSplits, Matcher};
 
 use shared::*;
 
@@ -172,7 +172,7 @@ fn split_fields(
     if line.is_empty() {
         return 0;
     }
-    let mut splits = FindSplits::new(line, MatcherType::Find(delimiter)).map(|field| Span {
+    let mut splits = FindSplits::new(line, Matcher::Substring(delimiter)).map(|field| Span {
         offset: offset_within(line, field),
         length: field.len(),
     });
