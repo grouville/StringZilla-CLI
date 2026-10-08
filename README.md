@@ -12,6 +12,18 @@ cargo install --git https://github.com/ashvardanian/StringZilla-CLI --locked    
 cargo install --path . --force --locked                                                   # or a local clone
 ```
 
+For v6 development, use `main-dev`. Install CMake and a C compiler, then build from
+the checkout below. `rust-toolchain.toml` selects the tested nightly compiler while
+StringZilla v6's Rust 1.100 minimum is awaiting a stable release. The lockfile records
+the tested StringZilla revision; keep `--locked` when building or comparing changes.
+
+```bash
+git clone --branch main-dev https://github.com/ashvardanian/StringZilla-CLI
+cd StringZilla-CLI
+rustup toolchain install nightly-2026-10-08 --profile minimal --component rustfmt --component clippy
+cargo build --release --locked
+```
+
 Coding agents can pull the bundled skills from the same repository, which teach them the [multi-pass editing workflow](#multi-pass-agentic-file-editing) and where Unicode folding changes an answer:
 
 ```bash
