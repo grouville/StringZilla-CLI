@@ -1895,6 +1895,26 @@ fn path_bytes(path: &Path) -> &[u8] {
     }
 }
 
+/// Write GNU checksum filename escapes without changing the path's raw bytes.
+fn write_checksum_path(output: &mut dyn Write, path: &[u8], escaped: bool) -> io::Result<()> {
+    if !escaped {
+        return output.write_all(path);
+    }
+    let mut copied = 0;
+    for (index, byte) in path.iter().enumerate() {
+        let replacement: &[u8] = match byte {
+            b'\\' => b"\\\\",
+            b'\n' => b"\\n",
+            b'\r' => b"\\r",
+            _ => continue,
+        };
+        output.write_all(&path[copied..index])?;
+        output.write_all(replacement)?;
+        copied = index + 1;
+    }
+    output.write_all(&path[copied..])
+}
+
 /// Render every record, reporting how many were written.
 fn write_digests_to<'a>(
     output: &mut dyn Write,
@@ -1907,18 +1927,26 @@ fn write_digests_to<'a>(
         // filename that is not valid UTF-8. JSON cannot: a string there has to be UTF-8, so
         // it keeps the lossy rendering.
         let path_bytes = path_bytes(path);
+        let escaped = config.terminator == Terminator::Newline
+            && matches!(config.format, Format::Coreutils | Format::Bsd)
+            && path_bytes
+                .iter()
+                .any(|byte| matches!(byte, b'\\' | b'\n' | b'\r'));
+        if escaped {
+            output.write_all(b"\\")?;
+        }
         match config.format {
             // Two spaces between digest and path is what `sha256sum` writes and what its own
             // `--check` expects back, so this stays byte-for-byte rather than merely similar.
             Format::Coreutils => {
                 write_digest_to(output, &hashed.digest)?;
                 output.write_all(b"  ")?;
-                output.write_all(path_bytes)?;
+                write_checksum_path(output, path_bytes, escaped)?;
             }
             // What `sha256sum --tag` writes, and what its `--check` reads back.
             Format::Bsd => {
                 output.write_all(b"SHA256 (")?;
-                output.write_all(path_bytes)?;
+                write_checksum_path(output, path_bytes, escaped)?;
                 output.write_all(b") = ")?;
                 write_digest_to(output, &hashed.digest)?;
             }
@@ -1998,6 +2026,8 @@ struct CheckLine<'a> {
 fn parse_check_line(line: &[u8]) -> Option<CheckLine<'_>> {
     let line = line.strip_suffix(b"\n").unwrap_or(line);
     let line = line.strip_suffix(b"\r").unwrap_or(line);
+    let escaped = line.starts_with(b"\\");
+    let line = if escaped { &line[1..] } else { line };
 
     // A BSD line names its algorithm first, so it is recognised by that prefix rather than by
     // a digest at column zero, and the two layouts cannot be confused.
@@ -2036,12 +2066,36 @@ fn parse_check_line(line: &[u8]) -> Option<CheckLine<'_>> {
     // The manifest holds the name's bytes, so it is rebuilt from them: rendering it through
     // `from_utf8_lossy` first would substitute U+FFFD and then fail to open a file that is
     // sitting right there.
+    let bytes = if escaped {
+        let mut decoded = Vec::with_capacity(path.len());
+        let mut remaining = path.iter().copied();
+        while let Some(byte) = remaining.next() {
+            decoded.push(if byte == b'\\' {
+                match remaining.next()? {
+                    b'\\' => b'\\',
+                    b'n' => b'\n',
+                    b'r' => b'\r',
+                    _ => return None,
+                }
+            } else {
+                byte
+            });
+        }
+        Cow::Owned(decoded)
+    } else {
+        Cow::Borrowed(path)
+    };
     #[cfg(unix)]
-    let path = Cow::Borrowed(Path::new(
-        <std::ffi::OsStr as std::os::unix::ffi::OsStrExt>::from_bytes(path),
-    ));
+    let path = match bytes {
+        Cow::Borrowed(bytes) => Cow::Borrowed(Path::new(
+            <std::ffi::OsStr as std::os::unix::ffi::OsStrExt>::from_bytes(bytes),
+        )),
+        Cow::Owned(bytes) => Cow::Owned(PathBuf::from(
+            <std::ffi::OsString as std::os::unix::ffi::OsStringExt>::from_vec(bytes),
+        )),
+    };
     #[cfg(not(unix))]
-    let path = Cow::Owned(PathBuf::from(String::from_utf8_lossy(path).into_owned()));
+    let path = Cow::Owned(PathBuf::from(String::from_utf8_lossy(&bytes).into_owned()));
     Some(CheckLine { digest, path })
 }
 
@@ -2439,6 +2493,56 @@ mod tests {
             .iter()
             .map(|path| sz::Sha256::hash(&fs::read(path).unwrap()))
             .collect()
+    }
+
+    #[test]
+    fn checksum_escaping_round_trips_special_names() {
+        let hashed = Hashed {
+            digest: [0x11; 32],
+            bytes: 7,
+        };
+        for name in ["line\nbreak", "back\\slash", "carriage\r", "mixed\\\n\r é"] {
+            for format in [Format::Coreutils, Format::Bsd] {
+                let path = Path::new(name);
+                let mut output = Vec::new();
+                write_digests_to(
+                    &mut output,
+                    std::iter::once((path, &hashed)),
+                    &OutputConfig {
+                        format,
+                        terminator: Terminator::Newline,
+                    },
+                )
+                .unwrap();
+                assert_eq!(output.first(), Some(&b'\\'));
+                assert_eq!(output.iter().filter(|&&byte| byte == b'\n').count(), 1);
+                let parsed = parse_check_line(&output).unwrap();
+                assert_eq!(parsed.path, path);
+                assert_eq!(parsed.digest, hashed.digest);
+            }
+            let mut output = Vec::new();
+            write_digests_to(
+                &mut output,
+                std::iter::once((Path::new(name), &hashed)),
+                &OutputConfig {
+                    format: Format::Coreutils,
+                    terminator: Terminator::Null,
+                },
+            )
+            .unwrap();
+            let mut expected = format!("{}  ", "11".repeat(32)).into_bytes();
+            expected.extend_from_slice(name.as_bytes());
+            expected.push(0);
+            assert_eq!(output, expected);
+        }
+    }
+
+    #[test]
+    fn rejects_unknown_and_unfinished_checksum_escapes() {
+        for name in ["bad\\q", "bad\\"] {
+            let line = format!("\\{}  {name}", "11".repeat(32));
+            assert!(parse_check_line(line.as_bytes()).is_none());
+        }
     }
 
     #[test]
