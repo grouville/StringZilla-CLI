@@ -807,6 +807,130 @@ fn cover(
     Ok(matches.to_vec())
 }
 
+// region: CPU Workers
+
+/// A CPU-only engine with one owner at a time. Device engines never enter this wrapper.
+struct CpuWorker {
+    engine: SubstringsEngine,
+    #[cfg(test)]
+    last_thread: Option<std::thread::ThreadId>,
+}
+
+// Safety: the constructor uses only the CPU's null stream and host allocator. The engine owns
+// its allocations, has no thread-bound device handle, and every operation takes an exclusive
+// borrow. ForkUnion joins before that borrow ends; no engine is ever shared between workers.
+unsafe impl Send for CpuWorker {}
+
+impl CpuWorker {
+    fn new(needles: &[String], case_sensitivity: CaseSensitivity) -> Result<Self, Failure> {
+        let stream = Stream::default(Capabilities::cpu_enabled());
+        Ok(Self {
+            engine: automaton(&stream, needles, case_sensitivity)?.into_inner(),
+            #[cfg(test)]
+            last_thread: None,
+        })
+    }
+
+    fn score(
+        &mut self,
+        lines: &Lines<'_>,
+        parameters: &Bm25Params,
+        weights: &[f32],
+        scores: &mut [f32],
+    ) -> Result<(), stringzilla::sz::Status> {
+        #[cfg(test)]
+        {
+            self.last_thread = Some(std::thread::current().id());
+        }
+        let capabilities = Capabilities::cpu_enabled();
+        capabilities.configure_thread()?;
+        let stream = Stream::default(capabilities);
+        stream.scope(|scope| {
+            self.engine
+                .bm25_scores(scope, lines, None, parameters, weights, scores, 1)
+        })
+    }
+}
+
+struct ScoreJob<'a> {
+    worker: &'a mut CpuWorker,
+    lines: Lines<'a>,
+    scores: &'a mut [f32],
+    result: Result<(), stringzilla::sz::Status>,
+}
+
+/// CPU search states survive across files; the pool only lives while scoring so its idle
+/// workers do not spin while the caller reads input, folds text, or writes output.
+struct CpuScoring {
+    threads: usize,
+    workers: Vec<CpuWorker>,
+}
+
+impl CpuScoring {
+    fn new(threads: Option<usize>) -> Self {
+        Self {
+            threads: threads
+                .filter(|count| *count != 0)
+                .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, usize::from)),
+            workers: Vec::new(),
+        }
+    }
+
+    fn score(
+        &mut self,
+        vocabulary: &Vocabulary,
+        case_sensitivity: CaseSensitivity,
+        lines: Lines<'_>,
+        parameters: &Bm25Params,
+        scores: &mut [f32],
+    ) -> Result<(), Failure> {
+        let threads = self.threads.min(scores.len());
+        while self.workers.len() < threads {
+            self.workers
+                .push(CpuWorker::new(&vocabulary.needles, case_sensitivity)?);
+        }
+        // One nonempty job per worker, even when the line count is not divisible by threads.
+        // Each job keeps its exclusive score slice and engine borrow until the pool joins.
+        let mut jobs = Vec::with_capacity(threads);
+        let mut remaining = scores;
+        let mut first = 0;
+        for (index, worker) in self.workers.iter_mut().take(threads).enumerate() {
+            let count = remaining.len().div_ceil(threads - index);
+            let (scores, rest) = remaining.split_at_mut(count);
+            remaining = rest;
+            jobs.push(ScoreJob {
+                worker,
+                lines: Lines {
+                    data: lines.data,
+                    offsets: &lines.offsets[first..=first + count],
+                },
+                scores,
+                result: Ok(()),
+            });
+            first += count;
+        }
+        let topology =
+            forkunion::Topology::new().map_err(|error| engine_failure("CPU topology", error))?;
+        let mut pool = forkunion::ThreadPool::spawn(&topology, threads)
+            .map_err(|error| engine_failure("CPU workers", error))?;
+        pool.for_slices_mut(&mut jobs, |jobs, _thread| {
+            for job in jobs {
+                job.result =
+                    job.worker
+                        .score(&job.lines, parameters, &vocabulary.weights, job.scores);
+            }
+        })
+        .map_err(|error| engine_failure("CPU scoring", error))?;
+        for job in jobs {
+            job.result
+                .map_err(|error| engine_failure("BM25 scoring", error))?;
+        }
+        Ok(())
+    }
+}
+
+// endregion: CPU Workers
+
 /// The pooled dictionary, the automaton compiled from it, and the device that walks it.
 ///
 /// One engine serves the whole run: every `--pattern` contributes its variants to a single
@@ -817,6 +941,8 @@ struct Engine<'stream> {
     vocabulary: Vocabulary,
     /// Applied to corpus and query alike before anything is matched.
     folder: Option<Folder<'stream>>,
+    cpu: RefCell<CpuScoring>,
+    case_sensitivity: CaseSensitivity,
 }
 
 impl<'stream> Engine<'stream> {
@@ -827,6 +953,7 @@ impl<'stream> Engine<'stream> {
         keyboard: &Keyboard,
         folds: &[Fold],
         device: &'stream Stream,
+        threads: Option<usize>,
     ) -> Result<Self, Failure> {
         // The query is folded first, so the ball is built in the domain the corpus will be matched
         // in rather than in the one the user typed.
@@ -866,6 +993,8 @@ impl<'stream> Engine<'stream> {
             automaton,
             vocabulary,
             folder,
+            cpu: RefCell::new(CpuScoring::new(threads)),
+            case_sensitivity: config.case_sensitivity,
         })
     }
 
@@ -896,8 +1025,8 @@ impl<'stream> Engine<'stream> {
             Bm25Params::unnormalized()
         };
 
-        let mut automaton = self.automaton.borrow_mut();
         if is_gpu(self.device) {
+            let mut automaton = self.automaton.borrow_mut();
             let allocator = UnifiedAllocator::new(self.device);
             let mut weights = Vec::new_in(allocator);
             weights.extend_from_slice(&self.vocabulary.weights);
@@ -917,7 +1046,16 @@ impl<'stream> Engine<'stream> {
                 })
                 .map_err(|error| engine_failure("BM25 scoring", error))?;
             scores.copy_from_slice(&staged_scores);
+        } else if self.cpu.borrow().threads > 1 && corpus.len() > 1 {
+            self.cpu.borrow_mut().score(
+                &self.vocabulary,
+                self.case_sensitivity,
+                corpus.host_lines(),
+                &parameters,
+                &mut scores,
+            )?;
         } else {
+            let mut automaton = self.automaton.borrow_mut();
             self.device
                 .scope(|scope| {
                     automaton.bm25_scores(
@@ -1681,7 +1819,7 @@ fn build_device(device: Device, gpu_id: Option<usize>) -> Result<Stream, String>
             let ordinal = gpu_id.unwrap_or(0);
             Capabilities::cuda_enabled(ordinal)
                 .and_then(|capabilities| Stream::new(capabilities, ordinal))
-                .map_err(|error| format!("--device gpu is unavailable: {error:?}"))
+                .map_err(|error| format!("--device gpu is unavailable: {error}"))
         }
     }
 }
@@ -1734,7 +1872,7 @@ fn run(args: &Args, output: &mut dyn Write, notes: &mut dyn Write) -> Result<Sta
     let folds = resolve_folds(&args.fold, effort.folding())?;
 
     let config = SearchConfig::resolve(args, effort);
-    let engine = Engine::build(&patterns, &config, &keyboard, &folds, &device)?;
+    let engine = Engine::build(&patterns, &config, &keyboard, &folds, &device, args.threads)?;
 
     let output_config = OutputConfig {
         line_numbers: args.fields.contains(&Field::LineNumbers),
@@ -2273,13 +2411,242 @@ mod tests {
     fn matching_lines(patterns: &[&str], data: &[u8], config: &SearchConfig) -> Vec<String> {
         let patterns: Vec<String> = patterns.iter().map(|p| p.to_string()).collect();
         let device = cpu();
-        let engine = Engine::build(&patterns, config, &us(), &[], &device).expect("engine builds");
+        let engine =
+            Engine::build(&patterns, config, &us(), &[], &device, Some(1)).expect("engine builds");
         let found = search_lines(data, &engine, config).expect("search runs");
         found
             .survivors(0.0, Newlines::from_utf8(config.utf8))
             .into_iter()
             .map(|(_, line, _)| String::from_utf8_lossy(line).into_owned())
             .collect()
+    }
+
+    #[test]
+    fn staged_corpora_keep_host_line_views_and_read_the_staged_sequence() {
+        let stream = cpu();
+        for lines in [
+            vec![],
+            vec![b"".as_slice()],
+            vec![b"".as_slice(), b"needle", b""],
+            vec![b"one".as_slice(), b"two"],
+        ] {
+            let mut corpus = Corpus::gathered(&stream, lines.iter().copied()).unwrap();
+            let sequence =
+                Sequence::copy(&lines, &UnifiedAllocator::new(&stream), &stream).unwrap();
+            if let Corpus::Host { staged, .. } = &mut corpus {
+                *staged = Some(sequence);
+            }
+            assert_eq!(corpus.len(), lines.len());
+            assert_eq!(corpus.bytes(), lines.concat());
+            for (index, line) in lines.iter().enumerate() {
+                assert_eq!(corpus.line(index), *line);
+            }
+            let mut engine = automaton(&stream, &["needle".to_string()], CaseSensitivity::Cased)
+                .unwrap()
+                .into_inner();
+            let mut counts = vec![0; lines.len()];
+            stream
+                .scope(|scope| engine.counts(scope, &corpus, &mut counts, 1))
+                .unwrap();
+            for (count, line) in counts.iter().zip(lines) {
+                assert_eq!(*count, usize::from(line == b"needle"));
+            }
+        }
+    }
+
+    #[test]
+    fn thread_count_includes_the_caller_and_zero_uses_available_cores() {
+        assert_eq!(CpuScoring::new(Some(1)).threads, 1);
+        assert_eq!(CpuScoring::new(Some(8)).threads, 8);
+        let available = std::thread::available_parallelism().map_or(1, usize::from);
+        assert_eq!(CpuScoring::new(None).threads, available);
+        assert_eq!(CpuScoring::new(Some(0)).threads, available);
+    }
+
+    #[test]
+    fn parallel_scoring_preserves_the_whole_corpus_mean() {
+        let stream = cpu();
+        let patterns = vec!["color".to_string(), "phonetic".to_string()];
+        let mut config = config(1);
+        config.case_sensitivity = CaseSensitivity::Uncased;
+        config.utf8 = true;
+        let folds = resolve_folds(&[], Folding::Sounds).unwrap();
+        let data = "color\n\nCOLOUR in a much longer line than the other matches\nkolor\n\nphonetic\nfunetik\nmissing\ncolor color color\nlast";
+        let serial = Engine::build(&patterns, &config, &us(), &folds, &stream, Some(1)).unwrap();
+        let expected = search_lines(data.as_bytes(), &serial, &config).unwrap();
+        assert!(
+            serial.cpu.borrow().workers.is_empty(),
+            "one thread needs no pool"
+        );
+        for threads in [2, 4, 8] {
+            let parallel =
+                Engine::build(&patterns, &config, &us(), &folds, &stream, Some(threads)).unwrap();
+            let actual = search_lines(data.as_bytes(), &parallel, &config).unwrap();
+            assert_eq!(
+                actual.scores, expected.scores,
+                "--threads {threads} changed scores"
+            );
+            assert_eq!(
+                actual.survivors(0.0, Newlines::from_utf8(true)),
+                expected.survivors(0.0, Newlines::from_utf8(true))
+            );
+            // Reuse each state on a shorter input, including a final line without a newline.
+            let expected = search_lines(b"color\n\nphonetic", &serial, &config).unwrap();
+            let actual = search_lines(b"color\n\nphonetic", &parallel, &config).unwrap();
+            assert_eq!(actual.scores, expected.scores);
+        }
+    }
+
+    #[test]
+    fn fork_union_runs_scoring_on_the_requested_workers() {
+        let stream = cpu();
+        let config = config(0);
+        for count in [2, 4, 8] {
+            let engine = Engine::build(
+                &["needle".to_string()],
+                &config,
+                &us(),
+                &[],
+                &stream,
+                Some(count),
+            )
+            .unwrap();
+            let data = "needle\n".repeat(count + 2);
+            assert!(search_lines(data.as_bytes(), &engine, &config).is_ok());
+            let states = engine.cpu.borrow();
+            assert_eq!(states.workers.len(), count);
+            let threads: HashSet<_> = states
+                .workers
+                .iter()
+                .map(|worker| worker.last_thread.unwrap())
+                .collect();
+            assert_eq!(
+                threads.len(),
+                count,
+                "--threads {count} must run each nonempty batch"
+            );
+            assert!(
+                threads.contains(&std::thread::current().id()),
+                "the caller counts as one worker"
+            );
+        }
+    }
+
+    #[test]
+    fn parallel_scoring_returns_worker_errors() {
+        let stream = cpu();
+        let corpus =
+            Corpus::gathered(&stream, [b"needle".as_slice(), b"needle"].into_iter()).unwrap();
+        let vocabulary = Vocabulary::build(
+            &["needle".to_string()],
+            0,
+            Alphabet::Script,
+            &us(),
+            Dictionary::Ignored,
+        );
+        let mut scoring = CpuScoring::new(Some(2));
+        let mut scores = [0.0; 2];
+        let result = scoring.score(
+            &vocabulary,
+            CaseSensitivity::Cased,
+            corpus.host_lines(),
+            &Bm25Params::normalized(0.0),
+            &mut scores,
+        );
+        assert!(
+            result.is_err(),
+            "an invalid corpus mean must not look like an unmatched input"
+        );
+    }
+
+    #[test]
+    fn empty_and_short_inputs_do_not_spawn_unused_workers() {
+        let stream = cpu();
+        let config = config(0);
+        let engine = Engine::build(
+            &["needle".to_string()],
+            &config,
+            &us(),
+            &[],
+            &stream,
+            Some(8),
+        )
+        .unwrap();
+        assert!(search_lines(b"", &engine, &config)
+            .unwrap()
+            .scores
+            .is_empty());
+        assert_eq!(
+            search_lines(b"needle", &engine, &config)
+                .unwrap()
+                .matched_count(0.0, None),
+            1
+        );
+        assert!(engine.cpu.borrow().workers.is_empty());
+        search_lines(b"needle\nmissing", &engine, &config).unwrap();
+        assert_eq!(engine.cpu.borrow().workers.len(), 2);
+    }
+
+    #[test]
+    fn thread_counts_preserve_ranked_json_and_original_match_spans() {
+        let directory = tempfile::tempdir().unwrap();
+        let first = directory.path().join("first.txt");
+        let second = directory.path().join("second.txt");
+        std::fs::write(
+            &first,
+            "color\ncolour\nkolor\ncolor color\nmissing\n\nphonetic\nfunetik\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &second,
+            "phonetic in a longer line\nFUNETIK\nmissing\ncolor",
+        )
+        .unwrap();
+        for show in ["lines", "matches", "count", "files", "files-without"] {
+            let mut baseline = None;
+            for threads in [1, 2, 4, 8] {
+                let args = Args::try_parse_from([
+                    "sz-fuzzy-find",
+                    "--pattern",
+                    "color",
+                    "--pattern",
+                    "phonetic",
+                    "--effort",
+                    "sounds",
+                    "--threads",
+                    &threads.to_string(),
+                    "--show",
+                    show,
+                    "--top-k",
+                    "3",
+                    "--format",
+                    "json",
+                    "--summary",
+                    "--fields",
+                    if show == "count" {
+                        "scores"
+                    } else {
+                        "line-numbers,scores"
+                    },
+                    first.to_str().unwrap(),
+                    second.to_str().unwrap(),
+                ])
+                .unwrap();
+                let mut output = Vec::new();
+                let mut notes = Vec::new();
+                let status = run(&args, &mut output, &mut notes).unwrap();
+                if let Some((expected_status, expected_output, expected_notes)) = &baseline {
+                    assert_eq!(&status, expected_status);
+                    assert_eq!(
+                        &output, expected_output,
+                        "--show {show} --threads {threads}"
+                    );
+                    assert_eq!(&notes, expected_notes);
+                } else {
+                    baseline = Some((status, output, notes));
+                }
+            }
+        }
     }
 
     #[test]
@@ -2356,7 +2723,7 @@ mod tests {
         let patterns = vec!["color".to_string()];
         let config = config(0);
         let device = cpu();
-        let engine = Engine::build(&patterns, &config, &us(), &[], &device).unwrap();
+        let engine = Engine::build(&patterns, &config, &us(), &[], &device, Some(1)).unwrap();
         let found = search_lines(data, &engine, &config).unwrap();
         let survivors: Vec<&[u8]> = found
             .survivors(0.0, Newlines::from_utf8(config.utf8))
@@ -2376,7 +2743,7 @@ mod tests {
         let patterns = vec!["color".to_string()];
         let config = config(1);
         let device = cpu();
-        let engine = Engine::build(&patterns, &config, &us(), &[], &device).unwrap();
+        let engine = Engine::build(&patterns, &config, &us(), &[], &device, Some(1)).unwrap();
         let out_cfg = OutputConfig {
             line_numbers: false,
             scores: false,
@@ -2455,7 +2822,8 @@ mod tests {
         let patterns = vec!["color".to_string()];
         let config = config(1);
         let device = cpu();
-        let engine = Engine::build(&patterns, &config, &us(), &[], &device).expect("engine builds");
+        let engine =
+            Engine::build(&patterns, &config, &us(), &[], &device, Some(1)).expect("engine builds");
         assert!(
             engine.folder.is_none(),
             "an empty chain compiled an automaton"
@@ -2808,8 +3176,8 @@ mod tests {
         };
         let folds = resolve_folds(&[], effort.folding()).expect("folds resolve");
         let patterns = vec![pattern.to_string()];
-        let engine =
-            Engine::build(&patterns, &config, &us(), &folds, device).expect("engine builds");
+        let engine = Engine::build(&patterns, &config, &us(), &folds, device, Some(1))
+            .expect("engine builds");
         (engine, config)
     }
 
