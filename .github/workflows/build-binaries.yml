@@ -100,7 +100,7 @@ jobs:
         run: echo "version=$(cat VERSION)" >> "$GITHUB_OUTPUT"
 
       # No `--features`: `sz-outline` and `sz-fuzzy-find` carry `required-features`, so a
-      # default build skips them and `stringzilla/cpus` never reaches a release artifact.
+      # default build skips them. The archive count below checks the selected tools.
       # The count assertion in `Stage archive` is what enforces that in both directions.
       - name: Build
         run: cargo build --release --locked --target ${{ matrix.target }}

@@ -7,8 +7,8 @@
 //! Lines are held in a `BytesCowsAuto` borrowing the input buffer, which packs an offset and a
 //! length per line and sizes both from the data. A `Vec<&[u8]>` would spend 16 bytes per line on
 //! fat pointers against 5 or 6 for the packed entry, which over a large file outweighs the input
-//! itself. `argsort_by` reaches the lines through a callback, so neither form needs a materialized
-//! slice array.
+//! itself. The v6 sorting API takes a slice, so this adapter also holds 16 bytes per line in
+//! temporary borrowed slices while computing the permutation.
 //!
 //! Exit: 0 wrote a line, 1 wrote none or `--is-sorted` found the input unsorted, 2 could not run.
 
@@ -110,11 +110,10 @@ fn sorted_order(
     order: SortOrder,
 ) -> Result<Vec<sz::SortedIdx>, sz::Status> {
     let mut permutation = vec![0usize; lines.len()];
-    sz::argsort_by(
-        |index| line_at(lines, index),
-        &mut permutation,
-        order.argsort_options(),
-    )?;
+    let borrowed: Vec<&[u8]> = (0..lines.len())
+        .map(|index| line_at(lines, index))
+        .collect();
+    sz::argsort(&borrowed, &mut permutation, order.argsort_options())?;
     Ok(permutation)
 }
 
