@@ -110,9 +110,7 @@ fn sorted_order(
     order: SortOrder,
 ) -> Result<Vec<sz::SortedIdx>, sz::Status> {
     let mut permutation = vec![0usize; lines.len()];
-    let borrowed: Vec<&[u8]> = (0..lines.len())
-        .map(|index| line_at(lines, index))
-        .collect();
+    let borrowed: Vec<&[u8]> = lines.iter().collect();
     sz::argsort(&borrowed, &mut permutation, order.argsort_options())?;
     Ok(permutation)
 }

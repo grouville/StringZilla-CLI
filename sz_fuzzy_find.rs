@@ -626,8 +626,11 @@ impl<'a, 'stream> Corpus<'a, 'stream> {
         lines: impl Iterator<Item = &'b [u8]> + Clone,
     ) -> Result<Self, Failure> {
         // The first pass sizes the buffer and the second fills it without a temporary slice list.
-        let mut data = Vec::with_capacity(lines.clone().map(|line| line.len()).sum());
-        let mut offsets = Vec::with_capacity(lines.clone().count() + 1);
+        let (bytes, entries) = lines.clone().fold((0, 0), |(bytes, entries), line| {
+            (bytes + line.len(), entries + 1)
+        });
+        let mut data = Vec::with_capacity(bytes);
+        let mut offsets = Vec::with_capacity(entries + 1);
         for line in lines {
             offsets.push(data.len());
             data.extend_from_slice(line);
@@ -648,7 +651,7 @@ impl<'a, 'stream> Corpus<'a, 'stream> {
         // GPU kernels require v6's canonical tape. Keep it for all verbs on this corpus,
         // and keep host views for scoring lengths and output without per-line stream joins.
         // Rewritten buffers remain reusable after their staged copy is no longer needed.
-        let lines: Vec<&[u8]> = (0..self.len()).map(|index| self.line(index)).collect();
+        let lines: Vec<&[u8]> = self.iter().collect();
         let sequence = Sequence::copy(&lines, &UnifiedAllocator::new(stream), stream)
             .map_err(|error| engine_failure("corpus staging", error))?;
         stream
@@ -704,6 +707,13 @@ impl<'a, 'stream> Corpus<'a, 'stream> {
         }
     }
 
+    fn iter(&self) -> impl ExactSizeIterator<Item = &[u8]> {
+        let Lines { data, offsets } = self.host_lines();
+        offsets
+            .windows(2)
+            .map(move |bounds| &data[bounds[0]..bounds[1]])
+    }
+
     fn reclaimed(self) -> Option<Rewrite<'stream>> {
         match self {
             Self::Rewritten { slot, .. } => Some(slot),
@@ -718,9 +728,9 @@ fn is_gpu(stream: &Stream) -> bool {
 
 fn automaton(
     stream: &Stream,
-    needles: &[String],
+    needles: &[impl AsRef<[u8]>],
     case_sensitivity: CaseSensitivity,
-) -> Result<RefCell<SubstringsEngine>, Failure> {
+) -> Result<SubstringsEngine, Failure> {
     SubstringsEngine::new(
         needles,
         case_sensitivity,
@@ -730,7 +740,6 @@ fn automaton(
         0,
         stream,
     )
-    .map(RefCell::new)
     .map_err(|error| engine_failure("multi-pattern search", error))
 }
 
@@ -825,7 +834,7 @@ impl CpuWorker {
     fn new(needles: &[String], case_sensitivity: CaseSensitivity) -> Result<Self, Failure> {
         let stream = Stream::default(Capabilities::cpu_enabled());
         Ok(Self {
-            engine: automaton(&stream, needles, case_sensitivity)?.into_inner(),
+            engine: automaton(&stream, needles, case_sensitivity)?,
             #[cfg(test)]
             last_thread: None,
         })
@@ -967,8 +976,9 @@ impl<'stream> Engine<'stream> {
             Some(folder) => {
                 let sources = patterns.iter().map(|one| one.as_bytes());
                 let folded = folder.apply(device, &Corpus::gathered(device, sources)?)?;
-                (0..folded.len())
-                    .map(|index| String::from_utf8_lossy(folded.line(index)).into_owned())
+                folded
+                    .iter()
+                    .map(|line| String::from_utf8_lossy(line).into_owned())
                     .collect()
             }
             None => patterns.to_vec(),
@@ -990,7 +1000,7 @@ impl<'stream> Engine<'stream> {
         let automaton = automaton(device, &vocabulary.needles, config.case_sensitivity)?;
         Ok(Self {
             device,
-            automaton,
+            automaton: RefCell::new(automaton),
             vocabulary,
             folder,
             cpu: RefCell::new(CpuScoring::new(threads)),
@@ -1215,15 +1225,16 @@ impl<'stream> Layer<'stream> {
         folds: &[&Fold],
         case_sensitivity: CaseSensitivity,
     ) -> Result<Self, Failure> {
-        let mut sources = Vec::new();
-        let mut targets = Vec::new();
-        for fold in folds {
-            sources.extend(fold.sources.iter().cloned());
-            targets.extend(fold.targets.iter().cloned());
-        }
+        let sources: Vec<&[u8]> = folds
+            .iter()
+            .flat_map(|fold| fold.sources.iter().map(String::as_bytes))
+            .collect();
+        let targets = folds
+            .iter()
+            .flat_map(|fold| fold.targets.iter().map(String::as_bytes));
         Ok(Self {
-            automaton: automaton(device, &sources, case_sensitivity)?,
-            targets: Corpus::gathered(device, targets.iter().map(|target| target.as_bytes()))?,
+            automaton: RefCell::new(automaton(device, &sources, case_sensitivity)?),
+            targets: Corpus::gathered(device, targets)?,
         })
     }
 }
@@ -1444,9 +1455,7 @@ impl<'stream> Layer<'stream> {
             });
             drift += produced as i64 - one.byte_length as i64;
         }
-        for tail in line..corpus.len() {
-            starts[tail + 1] = sites.len();
-        }
+        starts[line + 1..].fill(sites.len());
         Ok(LayerMap { sites, starts })
     }
 }
@@ -1556,10 +1565,14 @@ struct Searched<'a, 'stream> {
 }
 
 impl Searched<'_, '_> {
-    /// A line matched when it clears the floor, which defaults to any positive score - and a
-    /// positive score means "matched" only because every weight is strictly positive.
-    fn matched(&self, index: usize, floor: f32) -> bool {
-        self.scores[index] > 0.0 && self.scores[index] >= floor
+    /// Positions and scores of lines that clear the floor, which defaults to any positive score.
+    /// A positive score means "matched" only because every weight is strictly positive.
+    fn matching_scores(&self, floor: f32) -> impl Iterator<Item = (usize, f32)> + '_ {
+        self.scores
+            .iter()
+            .copied()
+            .enumerate()
+            .filter(move |(_, score)| *score > 0.0 && *score >= floor)
     }
 
     /// How many lines matched, without gathering them.
@@ -1568,9 +1581,7 @@ impl Searched<'_, '_> {
     /// line, so on a corpus that mostly matches they would otherwise build a list per input only
     /// to ask for its length.
     fn matched_count(&self, floor: f32, top: Option<usize>) -> usize {
-        let matched = (0..self.corpus.len())
-            .filter(|index| self.matched(*index, floor))
-            .count();
+        let matched = self.matching_scores(floor).count();
         top.map_or(matched, |top| matched.min(top))
     }
 
@@ -1579,15 +1590,8 @@ impl Searched<'_, '_> {
     /// The scored pass already said which lines these are, so they are gathered once here and
     /// every output mode reads from the list rather than re-testing the corpus.
     fn survivors(&self, floor: f32, newlines: Newlines) -> Vec<(usize, &[u8], f32)> {
-        (0..self.corpus.len())
-            .filter(|index| self.matched(*index, floor))
-            .map(|index| {
-                (
-                    index,
-                    trimmed(self.corpus.line(index), newlines),
-                    self.scores[index],
-                )
-            })
+        self.matching_scores(floor)
+            .map(|(index, score)| (index, trimmed(self.corpus.line(index), newlines), score))
             .collect()
     }
 }
@@ -2441,9 +2445,8 @@ mod tests {
             for (index, line) in lines.iter().enumerate() {
                 assert_eq!(corpus.line(index), *line);
             }
-            let mut engine = automaton(&stream, &["needle".to_string()], CaseSensitivity::Cased)
-                .unwrap()
-                .into_inner();
+            let mut engine =
+                automaton(&stream, &["needle".to_string()], CaseSensitivity::Cased).unwrap();
             let mut counts = vec![0; lines.len()];
             stream
                 .scope(|scope| engine.counts(scope, &corpus, &mut counts, 1))
@@ -2659,9 +2662,8 @@ mod tests {
             data: lines.data,
             offsets: &lines.offsets[1..],
         };
-        let mut engine = automaton(&stream, &["needle".to_string()], CaseSensitivity::Cased)
-            .unwrap()
-            .into_inner();
+        let mut engine =
+            automaton(&stream, &["needle".to_string()], CaseSensitivity::Cased).unwrap();
         let mut counts = [0usize; 2];
         stream
             .scope(|scope| engine.counts(scope, &suffix, &mut counts, 1))
