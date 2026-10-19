@@ -12,10 +12,11 @@ cargo install --git https://github.com/ashvardanian/StringZilla-CLI --locked    
 cargo install --path . --force --locked                                                   # or a local clone
 ```
 
-For v6 development, use `main-dev`, which follows StringZilla `main-v6` and ForkUnion `main-v4`.
-Install CMake and C and C++ compilers before building.
-`rust-toolchain.toml` selects the tested `nightly-2026-10-08` compiler while StringZilla v6's Rust 1.100 minimum is awaiting a stable release.
-`Cargo.lock` records the tested dependency revisions; keep `--locked` when building or comparing changes.
+For CLI development, clone this repository's `main-dev` branch.
+It depends on StringZilla's `main-v6` branch and ForkUnion's `main-v4` branch.
+Install CMake and a C/C++ compiler first.
+The repository pins Rust to `nightly-2026-10-08` because StringZilla v6 needs Rust 1.100, which is not yet stable.
+Keep `--locked` in build and test commands to use the dependency revisions recorded in `Cargo.lock`.
 
 ```bash
 git clone --branch main-dev https://github.com/ashvardanian/StringZilla-CLI
@@ -426,7 +427,8 @@ $ sz-sort file.txt --output sorted.txt # to a file (replaces: sort -o)
 $ sz-sort --is-sorted file.txt          # exit 1 unless already sorted (replaces: sort -c)
 ```
 
-Lines borrow the input through the slice table consumed by StringZilla, with one reference and one permutation index per line.
+Sorting keeps the line text in the input buffer, without copying it.
+It stores a reference to each line and an index for its position in the sorted output.
 Sorting rewards short records, so the corpus is first split into one word per line:
 
 ```bash
@@ -722,12 +724,11 @@ $ sz-fuzzy-find --device cpu --threads 8 needle big.txt # CPU, 8 threads
 $ sz-fuzzy-find --device gpu needle big.txt             # GPU (see build note)
 ```
 
-CPU execution is the default, and `--threads` controls CPU scoring through ForkUnion v4.
-The count includes the calling thread: `--threads 8` uses it and up to seven additional workers.
-Omitting `--threads` or passing `--threads 0` uses the available CPU count, bounded by the number of lines to score; `--threads 1` keeps scoring on the caller.
-Inputs smaller than 64 KiB stay on the caller, and larger inputs reuse sleeping workers between files.
-For CPU execution, folding and output run on the caller, and changing the thread count preserves scores and result order.
-Larger query dictionaries and more workers use more memory; use a lower thread count when memory is limited.
+CPU execution is the default. `--threads` sets the maximum number of CPU threads used for scoring, including the calling thread.
+For example, `--threads 8` allows up to seven additional workers; `--threads 1` scores on the calling thread alone.
+Omitting the option or using `--threads 0` uses the available CPU count, with fewer threads when the input is small.
+Reading, Unicode folding, and printing run on the calling thread. Changing the thread count preserves scores and result order.
+More workers and larger query dictionaries use more memory; lower `--threads` when memory is limited.
 
 Use `--device gpu` to request GPU execution; `--threads` is a CPU setting and cannot be combined with it.
 The GPU path requires both the `fuzzy-find` and `cuda` features, plus a CUDA toolkit and a compatible host compiler for StringZilla v6:
