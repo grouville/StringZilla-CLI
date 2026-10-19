@@ -71,7 +71,7 @@ fn collect_lines(data: &[u8], newlines: Newlines) -> Vec<&[u8]> {
 }
 
 /// Fold case and reverse inside the kernel without materializing keys.
-fn sorted_order(lines: &[&[u8]], order: SortOrder) -> Result<Vec<sz::SortedIdx>, sz::Status> {
+fn sorted_order(lines: &[&[u8]], order: SortOrder) -> Result<Vec<usize>, sz::Status> {
     let mut permutation = vec![0usize; lines.len()];
     sz::argsort(lines, &mut permutation, order.argsort_options())?;
     Ok(permutation)
@@ -122,7 +122,7 @@ fn write_summary_json(
 /// Returns how many lines were written.
 fn write_sorted(
     lines: &[&[u8]],
-    permutation: &[sz::SortedIdx],
+    permutation: &[usize],
     order: SortOrder,
     config: &OutputConfig,
     output: &mut dyn Write,
