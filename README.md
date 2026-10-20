@@ -429,6 +429,7 @@ $ sz-sort --is-sorted file.txt          # exit 1 unless already sorted (replaces
 
 Sorting keeps the line text in the input buffer, without copying it.
 It stores a reference to each line and an index for its position in the sorted output.
+On 64-bit systems, those references and indices take 24 bytes per line in total.
 Sorting rewards short records, so the corpus is first split into one word per line:
 
 ```bash
@@ -737,6 +738,9 @@ The GPU path requires both the `fuzzy-find` and `cuda` features, plus a CUDA too
 $ cargo build --release --locked --bin sz-fuzzy-find --features fuzzy-find,cuda
 $ ./target/release/sz-fuzzy-find --device gpu needle big.txt
 ```
+
+GPU execution keeps a copy of the input in memory the GPU can read, alongside the original text used for printing matches.
+It uses more memory than CPU execution. Search buffers grow when an input needs more room; there is no fixed one-million-line limit.
 
 ## Workflows
 
