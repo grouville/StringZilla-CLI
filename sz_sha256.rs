@@ -249,7 +249,7 @@ type Outcome = Result<Hashed, io::Error>;
 
 /// Why a slot stopped.
 ///
-/// An errno rather than an `io::Error`, because a worker may not allocate and
+/// Store the OS error code or error kind, because a worker may not allocate and
 /// `io::Error::new(kind, string)` does. The path is attached at report time, which is also the
 /// only place `shared::At` can turn it into a `Failure`.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -258,6 +258,8 @@ enum Stopped {
     Ended,
     /// A read came back with this errno.
     Errno(i32),
+    /// A read failed without an OS error code.
+    ReadError(io::ErrorKind),
     /// A read short of the end returned zero: the file shrank underneath the run.
     Shrank,
 }
@@ -267,6 +269,7 @@ impl Stopped {
         match self {
             Stopped::Ended => None,
             Stopped::Errno(errno) => Some(io::Error::from_raw_os_error(errno)),
+            Stopped::ReadError(kind) => Some(io::Error::from(kind)),
             Stopped::Shrank => Some(io::Error::from(io::ErrorKind::UnexpectedEof)),
         }
     }
@@ -658,8 +661,11 @@ impl Fleet for BlockingFleet {
                     Ok(taken) => filled += taken,
                     Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
                     Err(error) => {
-                        let errno = error.raw_os_error().unwrap_or(libc::EIO);
-                        self.stop(slot, Stopped::Errno(errno));
+                        let stopped = match error.raw_os_error() {
+                            Some(errno) => Stopped::Errno(errno),
+                            None => Stopped::ReadError(error.kind()),
+                        };
+                        self.stop(slot, stopped);
                         break;
                     }
                 }
