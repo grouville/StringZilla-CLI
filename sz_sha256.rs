@@ -2702,8 +2702,10 @@ mod tests {
 
     #[test]
     fn writes_coreutils_format_byte_for_byte() {
-        let (_directory, paths) = scratch_files(&[7]);
-        let outcomes = hash_paths(&measured_files(&paths), &plan_with(DIRECT_IO_ALIGNMENT, 1));
+        let hashed = Hashed {
+            digest: [0x11; 32],
+            bytes: 7,
+        };
         let config = OutputConfig {
             format: Format::Coreutils,
             terminator: Terminator::Newline,
@@ -2713,18 +2715,14 @@ mod tests {
         assert_eq!(
             write_digests_to(
                 &mut rendered,
-                hashed(paths.iter().map(PathBuf::as_path), &outcomes),
+                std::iter::once((Path::new("file.bin"), &hashed)),
                 &config
             )
             .unwrap(),
             1
         );
 
-        let expected = format!(
-            "{}  {}\n",
-            hex(&sz::Sha256::hash(&fs::read(&paths[0]).unwrap())),
-            paths[0].display()
-        );
+        let expected = format!("{}  file.bin\n", "11".repeat(32));
         assert_eq!(String::from_utf8(rendered).unwrap(), expected);
     }
 
@@ -2904,37 +2902,42 @@ mod tests {
 
     #[test]
     fn reads_the_bsd_layout_it_writes() {
-        let (_directory, paths) = scratch_files(&[64, 4095]);
-        let digests = digests_directly(&paths);
-
-        let mut rendered = Vec::new();
-        let outcomes: Vec<Option<Outcome>> = digests
-            .iter()
-            .zip(&paths)
-            .map(|(digest, path)| {
-                Some(Ok(Hashed {
-                    digest: *digest,
-                    bytes: std::fs::metadata(path).unwrap().len(),
-                }))
-            })
-            .collect();
+        let entries = [
+            (
+                Path::new("file0.bin"),
+                Hashed {
+                    digest: [0x11; 32],
+                    bytes: 64,
+                },
+            ),
+            (
+                Path::new(r"C:\data\file1.bin"),
+                Hashed {
+                    digest: [0x22; 32],
+                    bytes: 4095,
+                },
+            ),
+        ];
         let config = OutputConfig {
             format: Format::Bsd,
             terminator: Terminator::from_null(false),
         };
+        let mut rendered = Vec::new();
         write_digests_to(
             &mut rendered,
-            hashed(paths.iter().map(PathBuf::as_path), &outcomes),
+            entries.iter().map(|(path, hashed)| (*path, hashed)),
             &config,
         )
         .unwrap();
 
         let text = String::from_utf8(rendered).unwrap();
         assert!(text.starts_with("SHA256 ("), "{}", text);
-        for (line, digest) in text.lines().zip(&digests) {
+        assert_eq!(text.lines().count(), entries.len());
+        for (line, (path, hashed)) in text.lines().zip(entries) {
             let mut line = line.as_bytes().to_vec();
             let parsed = parse_check_line(&mut line).expect("a BSD line is a checksum line");
-            assert_eq!(&parsed.digest, digest);
+            assert_eq!(parsed.digest, hashed.digest);
+            assert_eq!(parsed.path, path);
         }
     }
 
