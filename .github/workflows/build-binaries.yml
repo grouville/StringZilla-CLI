@@ -3,8 +3,8 @@ name: Build Binaries
 # One matrix, called from both `release.yml` and `prerelease.yml`, so the two paths cannot
 # drift into building different things. They differ only in `upload`.
 #
-# No top-level `permissions`: a called workflow may only narrow what its caller granted, so
-# declaring `contents: write` here would make the read-only pre-release caller invalid.
+# Permissions come from the caller: PR checks grant read access, releases grant write access.
+# The publishing job runs only when the caller requests an upload.
 on:
   workflow_call:
     inputs:
@@ -246,8 +246,6 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     needs: [build, package_deb]
-    permissions:
-      contents: write
     steps:
       - name: Checkout
         uses: actions/checkout@v7
