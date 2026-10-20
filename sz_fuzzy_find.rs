@@ -995,8 +995,12 @@ impl CpuScoring {
             let topology = forkunion::Topology::new()
                 .map_err(|error| engine_failure("CPU topology", error))?;
             self.pool = Some(
-                forkunion::ThreadPool::spawn(&topology, threads)
-                    .map_err(|error| engine_failure("CPU workers", error))?,
+                forkunion::ThreadPool::spawn_with_exclusivity(
+                    &topology,
+                    threads,
+                    forkunion::CallerExclusivity::Inclusive,
+                )
+                .map_err(|error| engine_failure("CPU workers", error))?,
             );
         }
         let pool = self.pool.as_mut().unwrap();
