@@ -12,7 +12,8 @@ cargo install --git https://github.com/ashvardanian/StringZilla-CLI --locked    
 cargo install --path . --force --locked                                                   # or a local clone
 ```
 
-For v6 development, use `main-dev`, which follows StringZilla `main-v6` and ForkUnion `main-v4`.
+For v6 development, this branch pins the fixes in [StringZilla #358](https://github.com/ashvardanian/StringZilla/pull/358) and follows ForkUnion `main-v4`.
+The StringZilla pin can move back to `main-v6` once those fixes land there.
 Install CMake and C and C++ compilers before building.
 `rust-toolchain.toml` selects the tested `nightly-2026-10-08` compiler while StringZilla v6's Rust 1.100 minimum is awaiting a stable release.
 `Cargo.lock` records the tested dependency revisions; keep `--locked` when building or comparing changes.
