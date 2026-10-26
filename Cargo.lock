@@ -203,8 +203,8 @@ checksum = "3e0f1c7c3a72c66fd80abe965175f7523475c0489a87d3ff9d6e8c87d87a9d2d"
 
 [[package]]
 name = "forkunion"
-version = "3.0.3"
-source = "git+https://github.com/ashvardanian/ForkUnion?branch=main-v4#075d14137420f204ff175acd2d29c22e163e241c"
+version = "4.0.0-rc.1"
+source = "git+https://github.com/ashvardanian/ForkUnion?branch=main-v4#10d306f27d908e440a269ed74277bd767f08ec6a"
 dependencies = [
  "cc",
 ]
@@ -424,8 +424,8 @@ checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
 
 [[package]]
 name = "stringzilla"
-version = "5.1.2"
-source = "git+https://github.com/ashvardanian/StringZilla?branch=main-v6#7826f358a51df3871fba5cc825ebab3e1163174a"
+version = "6.0.0-rc.1"
+source = "git+https://github.com/ashvardanian/StringZilla?rev=885b7957a4f674072fb7a54a5e5b6ec7a744cde6#885b7957a4f674072fb7a54a5e5b6ec7a744cde6"
 dependencies = [
  "cmake",
 ]

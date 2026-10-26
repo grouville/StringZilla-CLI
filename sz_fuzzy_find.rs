@@ -18,13 +18,12 @@
 use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
-use std::ffi::c_void;
 use std::io::{self, Write};
 
 use clap::{CommandFactory, Parser, ValueEnum};
 use stringzilla::sz::{
-    _SzSequence, Bm25Params, Capabilities, Capability, CaseSensitivity, Sequence, Stream, Strings,
-    SubstringsEngine, SubstringsMatch, SubstringsOverlapPolicy, UnifiedAllocator,
+    Bm25Params, Capabilities, Capability, CaseSensitivity, Match as SubstringsMatch, Stream,
+    Strings, StringsView, SubstringsEngine, SubstringsOverlapPolicy, UnifiedAllocator,
     SUBSTRINGS_HOT_STATES_AUTO, SUBSTRINGS_MATCHES_BUDGET_AUTO,
 };
 
@@ -501,12 +500,12 @@ enum Corpus<'a, 'stream> {
     Host {
         data: Cow<'a, [u8]>,
         offsets: Vec<usize>,
-        staged: Option<Sequence<'stream>>,
+        staged: Option<Strings<UnifiedAllocator<'stream>>>,
     },
     Rewritten {
         slot: Rewrite<'stream>,
         lines: usize,
-        staged: Option<Sequence<'stream>>,
+        staged: Option<Strings<UnifiedAllocator<'stream>>>,
     },
 }
 
@@ -518,49 +517,39 @@ struct Lines<'a> {
     offsets: &'a [usize],
 }
 
-// Safety: constructors partition live bytes with ascending, in-bounds offsets. The callbacks
-// borrow that partition for the call; neither the descriptor nor the bytes escape the scope.
-unsafe impl Strings for Lines<'_> {
-    fn with_sequence<Return>(
-        &self,
-        _stream: &Stream,
-        call: impl FnOnce(&_SzSequence) -> Return,
-    ) -> Result<Return, stringzilla::sz::Status> {
-        unsafe extern "C" fn start(handle: *const c_void, index: usize) -> *const c_void {
-            let lines = unsafe { &*handle.cast::<Lines<'_>>() };
-            unsafe { lines.data.as_ptr().add(lines.offsets[index]).cast() }
+impl<'a> Lines<'a> {
+    fn view(self) -> Result<StringsView<'a>, stringzilla::sz::Status> {
+        // Safety: usize has the same representation as the selected fixed-width unsigned type.
+        // The borrowed offsets stay live, and the view constructor checks their bounds.
+        #[cfg(target_pointer_width = "64")]
+        {
+            let offsets = unsafe {
+                std::slice::from_raw_parts(self.offsets.as_ptr().cast::<u64>(), self.offsets.len())
+            };
+            StringsView::from_u64_tape(self.data, offsets)
         }
-        unsafe extern "C" fn length(handle: *const c_void, index: usize) -> usize {
-            let lines = unsafe { &*handle.cast::<Lines<'_>>() };
-            lines.offsets[index + 1] - lines.offsets[index]
+        #[cfg(target_pointer_width = "32")]
+        {
+            let offsets = unsafe {
+                std::slice::from_raw_parts(self.offsets.as_ptr().cast::<u32>(), self.offsets.len())
+            };
+            StringsView::from_u32_tape(self.data, offsets)
         }
-        Ok(call(&_SzSequence {
-            handle: (self as *const Self).cast(),
-            count: self.offsets.len() - 1,
-            get_start: Some(start),
-            get_length: Some(length),
-        }))
     }
 }
 
-// Safety: a host corpus delegates to its bounded line partition. A device corpus delegates to
-// StringZilla's owned sequence, which keeps its managed bytes alive for the entire stream scope.
-unsafe impl Strings for Corpus<'_, '_> {
-    fn with_sequence<Return>(
-        &self,
-        stream: &Stream,
-        call: impl FnOnce(&_SzSequence) -> Return,
-    ) -> Result<Return, stringzilla::sz::Status> {
+impl Corpus<'_, '_> {
+    fn view(&self) -> Result<StringsView<'_>, stringzilla::sz::Status> {
         match self {
             Self::Host {
-                staged: Some(sequence),
+                staged: Some(strings),
                 ..
             }
             | Self::Rewritten {
-                staged: Some(sequence),
+                staged: Some(strings),
                 ..
-            } => sequence.with_sequence(stream, call),
-            _ => self.host_lines().with_sequence(stream, call),
+            } => Ok(strings.view()),
+            _ => self.host_lines().view(),
         }
     }
 }
@@ -648,17 +637,20 @@ impl<'a, 'stream> Corpus<'a, 'stream> {
         if !is_gpu(stream) {
             return Ok(self);
         }
-        // GPU kernels require v6's canonical tape. Keep it for all verbs on this corpus,
-        // and keep host views for scoring lengths and output without per-line stream joins.
-        // Rewritten buffers remain reusable after their staged copy is no longer needed.
-        let lines: Vec<&[u8]> = self.iter().collect();
-        let sequence = Sequence::copy(&lines, &UnifiedAllocator::new(stream), stream)
+        // Gather the host tape into shared allocations on the CPU, then let the GPU read it.
+        // Keep the host bytes for scoring lengths and output, and the owned column for GPU calls.
+        let host = Stream::default(Capabilities::cpu_enabled());
+        let source = self
+            .host_lines()
+            .view()
+            .map_err(|error| engine_failure("corpus staging", error))?;
+        let strings = Strings::copy_in(source, UnifiedAllocator::new(stream), &host)
             .map_err(|error| engine_failure("corpus staging", error))?;
         stream
             .synchronize()
             .map_err(|error| engine_failure("corpus staging", error))?;
         match &mut self {
-            Self::Host { staged, .. } | Self::Rewritten { staged, .. } => *staged = Some(sequence),
+            Self::Host { staged, .. } | Self::Rewritten { staged, .. } => *staged = Some(strings),
         }
         Ok(self)
     }
@@ -859,7 +851,7 @@ fn cover(
         .scope(|scope| {
             engine
                 .engine
-                .find(scope, corpus, &mut matches, &mut offsets)
+                .find(scope, corpus.view()?, &mut matches, &mut offsets)
         })
         .map_err(|error| engine_failure(counting, error))?;
     let needed = engine.engine.report().matches_emitted;
@@ -869,7 +861,7 @@ fn cover(
         .scope(|scope| {
             engine
                 .engine
-                .find(scope, corpus, &mut matches, &mut offsets)
+                .find(scope, corpus.view()?, &mut matches, &mut offsets)
         })
         .map_err(|error| engine_failure(locating, error))?;
     if engine.engine.report().shortfall != 0 {
@@ -921,9 +913,15 @@ impl CpuWorker {
         capabilities.configure_thread()?;
         let stream = Stream::default(capabilities);
         stream.scope(|scope| {
-            self.engine
-                .engine
-                .bm25_scores(scope, lines, None, parameters, weights, scores, 1)
+            self.engine.engine.bm25_scores(
+                scope,
+                lines.view()?,
+                None,
+                parameters,
+                weights,
+                scores,
+                1,
+            )
         })
     }
 }
@@ -1132,7 +1130,7 @@ impl<'stream> Engine<'stream> {
                 .scope(|scope| {
                     automaton.engine.bm25_scores(
                         scope,
-                        corpus,
+                        corpus.view()?,
                         None,
                         &parameters,
                         &weights,
@@ -1159,7 +1157,7 @@ impl<'stream> Engine<'stream> {
                 .scope(|scope| {
                     automaton.engine.bm25_scores(
                         scope,
-                        corpus,
+                        corpus.view()?,
                         None,
                         &parameters,
                         &self.vocabulary.weights,
@@ -1479,9 +1477,13 @@ impl<'stream> Layer<'stream> {
             let (data, offsets) = slot.parts_upto(capacity, lines + 1);
             device
                 .scope(|scope| {
-                    engine
-                        .engine
-                        .replace(scope, corpus, &self.targets, data, offsets)
+                    engine.engine.replace(
+                        scope,
+                        corpus.view()?,
+                        self.targets.view()?,
+                        data,
+                        offsets,
+                    )
                 })
                 .map_err(|error| engine_failure("fold", error))?;
         }
@@ -1495,9 +1497,13 @@ impl<'stream> Layer<'stream> {
             let (data, offsets) = slot.parts_upto(capacity, lines + 1);
             device
                 .scope(|scope| {
-                    engine
-                        .engine
-                        .replace(scope, corpus, &self.targets, data, offsets)
+                    engine.engine.replace(
+                        scope,
+                        corpus.view()?,
+                        self.targets.view()?,
+                        data,
+                        offsets,
+                    )
                 })
                 .map_err(|error| engine_failure("fold", error))?;
         }
@@ -1507,9 +1513,13 @@ impl<'stream> Layer<'stream> {
             let (data, offsets) = slot.parts_upto(needed, lines + 1);
             device
                 .scope(|scope| {
-                    engine
-                        .engine
-                        .replace(scope, corpus, &self.targets, data, offsets)
+                    engine.engine.replace(
+                        scope,
+                        corpus.view()?,
+                        self.targets.view()?,
+                        data,
+                        offsets,
+                    )
                 })
                 .map_err(|error| engine_failure("fold", error))?;
         }
@@ -2549,10 +2559,14 @@ mod tests {
             vec![b"one".as_slice(), b"two"],
         ] {
             let mut corpus = Corpus::gathered(&stream, lines.iter().copied()).unwrap();
-            let sequence =
-                Sequence::copy(&lines, &UnifiedAllocator::new(&stream), &stream).unwrap();
+            let strings = Strings::copy_in(
+                StringsView::from_slices(&lines),
+                UnifiedAllocator::new(&stream),
+                &stream,
+            )
+            .unwrap();
             if let Corpus::Host { staged, .. } = &mut corpus {
-                *staged = Some(sequence);
+                *staged = Some(strings);
             }
             assert_eq!(corpus.len(), lines.len());
             assert_eq!(corpus.bytes(), lines.concat());
@@ -2563,7 +2577,7 @@ mod tests {
                 automaton(&stream, &["needle".to_string()], CaseSensitivity::Cased).unwrap();
             let mut counts = vec![0; lines.len()];
             stream
-                .scope(|scope| engine.engine.counts(scope, &corpus, &mut counts, 1))
+                .scope(|scope| engine.engine.counts(scope, corpus.view()?, &mut counts, 1))
                 .unwrap();
             for (count, line) in counts.iter().zip(lines) {
                 assert_eq!(*count, usize::from(line == b"needle"));
@@ -2821,7 +2835,7 @@ mod tests {
             automaton(&stream, &["needle".to_string()], CaseSensitivity::Cased).unwrap();
         let mut counts = [0usize; 2];
         stream
-            .scope(|scope| engine.engine.counts(scope, &suffix, &mut counts, 1))
+            .scope(|scope| engine.engine.counts(scope, suffix.view()?, &mut counts, 1))
             .unwrap();
         assert_eq!(counts, [0, 1]);
     }
