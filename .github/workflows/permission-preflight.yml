@@ -1,0 +1,22 @@
+name: CLI permission preflight
+
+on:
+  push:
+    branches: ["ci/cli7-permissions-20261025"]
+
+permissions:
+  contents: read
+
+jobs:
+  accepted:
+    name: Validate the read-only caller
+    runs-on: ubuntu-24.04
+    steps:
+      - run: echo "GitHub accepted the real shared workflow under contents read."
+
+  build_binaries:
+    if: github.event_name == 'workflow_dispatch'
+    uses: ./.github/workflows/build-binaries.yml
+    with:
+      ref: ${{ github.sha }}
+      upload: false
